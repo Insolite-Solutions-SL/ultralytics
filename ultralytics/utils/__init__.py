@@ -350,7 +350,7 @@ def set_logging(name="LOGGING_NAME", verbose=True):
     level = logging.INFO if verbose and RANK in {-1, 0} else logging.ERROR  # rank in world for Multi-GPU trainings
 
     # Configure the console (stdout) encoding to UTF-8, with checks for compatibility
-    formatter = logging.Formatter("%(message)s")  # Default formatter
+    formatter = logging.Formatter('%(asctime)s.%(msecs)03d - %(levelname)s - %(message)s',)  # Default formatter
     if WINDOWS and hasattr(sys.stdout, "encoding") and sys.stdout.encoding != "utf-8":
 
         class CustomFormatter(logging.Formatter):
@@ -368,10 +368,10 @@ def set_logging(name="LOGGING_NAME", verbose=True):
 
                 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
             else:
-                formatter = CustomFormatter("%(message)s")
+                formatter = CustomFormatter('%(asctime)s.%(msecs)03d - %(levelname)s - %(message)s',)
         except Exception as e:
             print(f"Creating custom formatter for non UTF-8 environments due to {e}")
-            formatter = CustomFormatter("%(message)s")
+            formatter = CustomFormatter('%(asctime)s.%(msecs)03d - %(levelname)s - %(message)s',)
 
     # Create and configure the StreamHandler with the appropriate formatter and level
     stream_handler = logging.StreamHandler(sys.stdout)

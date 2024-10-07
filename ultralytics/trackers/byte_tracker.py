@@ -9,6 +9,14 @@ from .utils import matching
 from .utils.kalman_filter import KalmanFilterXYAH
 
 
+# Parámetros de coincidencia y reidentificación
+DISTANCE_TOLERANCE = 100.0  # Máxima distancia permitida para considerar que es el mismo track (en píxeles)
+SIZE_TOLERANCE = 0.4       # Tolerancia máxima de diferencia de tamaño (40%)
+MIN_OBSERVED_FRAMES = 5     # Número mínimo de frames observados antes de marcar un track como perdido
+
+# Diccionario para almacenar los tracks que se pierden temporalmente
+lost_tracks = {}
+
 class STrack(BaseTrack):
     """
     Single object tracking representation that uses Kalman filtering for state estimation.
@@ -77,6 +85,10 @@ class STrack(BaseTrack):
         self.cls = cls
         self.idx = xywh[-1]
         self.angle = xywh[4] if len(xywh) == 6 else None
+
+        # Nuevo: Añadir un historial de posiciones para cada track
+        self.position_history = []  # Almacena las posiciones previas del track para evaluación
+        self.position_history.append(self._tlwh.copy())  # Inicializar con la posición actual
 
     def predict(self):
         """Predicts the next state (mean and covariance) of the object using the Kalman filter."""
@@ -176,6 +188,9 @@ class STrack(BaseTrack):
         self.cls = new_track.cls
         self.angle = new_track.angle
         self.idx = new_track.idx
+
+        # Nuevo: Añadir la nueva posición al historial
+        self.position_history.append(self.tlwh.copy())
 
     def convert_coords(self, tlwh):
         """Convert a bounding box's top-left-width-height format to its x-y-aspect-height equivalent."""
@@ -290,6 +305,9 @@ class BYTETracker:
         self.kalman_filter = self.get_kalmanfilter()
         self.reset_id()
 
+        # Nuevo: Diccionario para manejar los tracks perdidos localmente en BYTETracker
+        self.lost_tracks = {}
+
     def update(self, results, img=None):
         """Updates the tracker with new detections and returns the current list of tracked objects."""
         self.frame_id += 1
@@ -365,8 +383,36 @@ class BYTETracker:
         for it in u_track:
             track = r_tracked_stracks[it]
             if track.state != TrackState.Lost:
-                track.mark_lost()
+                self.mark_lost_in_tracker(track)  # Llamar al nuevo método en lugar de `mark_lost`
                 lost_stracks.append(track)
+            else:
+                # Incrementar el contador de frames perdidos si ya estaba marcado como perdido
+                self.lost_tracks[track.track_id]['lost_frames'] += 1
+
+        # Intentar reidentificar tracks perdidos usando el historial de posiciones y tamaño
+        for idet in u_detection:
+            det = detections[idet]
+            reid_id = self.reidentify_track(det)  # Intentar reidentificar el track perdido con la nueva detección
+            if reid_id is not None:
+                # Log informativo de reidentificación
+                LOGGER.info(f"Track {reid_id} reidentificado con éxito en el frame {self.frame_id}")
+
+                # Buscar el track perdido en self.lost_stracks, asegurando que exista
+                lost_track_candidates = [t for t in self.lost_stracks if t.track_id == reid_id]
+                if len(lost_track_candidates) > 0:
+                    lost_track = lost_track_candidates[0]
+                else:
+                    LOGGER.warning(f"Track {reid_id} encontrado en `self.lost_tracks` pero no en `self.lost_stracks`.")
+                    continue  # Saltar este reidentificación si no está sincronizado
+
+                # Reactivar el track perdido con la nueva detección
+                lost_track.re_activate(det, self.frame_id, new_id=False)
+                activated_stracks.append(lost_track)
+
+                # Eliminar el track del diccionario de tracks perdidos
+                if reid_id in self.lost_tracks:
+                    del self.lost_tracks[reid_id]
+
         # Deal with unconfirmed tracks, usually tracks with only one beginning frame
         detections = [detections[i] for i in u_detection]
         dists = self.get_dists(unconfirmed, detections)
@@ -390,6 +436,11 @@ class BYTETracker:
             if self.frame_id - track.end_frame > self.max_time_lost:
                 track.mark_removed()
                 removed_stracks.append(track)
+
+        # Eliminar los tracks eliminados del diccionario `lost_tracks`
+        for track in removed_stracks:
+            if track.track_id in self.lost_tracks:
+                del self.lost_tracks[track.track_id]        
 
         self.tracked_stracks = [t for t in self.tracked_stracks if t.state == TrackState.Tracked]
         self.tracked_stracks = self.joint_stracks(self.tracked_stracks, activated_stracks)
@@ -423,6 +474,67 @@ class BYTETracker:
         """Predict the next states for multiple tracks using Kalman filter."""
         STrack.multi_predict(tracks)
 
+    def mark_lost_in_tracker(self, track):
+        """
+        Marca un track como perdido y lo almacena en el diccionario `lost_tracks` de BYTETracker.
+        """
+        if track.tracklet_len >= MIN_OBSERVED_FRAMES:
+            self.lost_tracks[track.track_id] = {
+                'bbox': track.tlwh.copy(),
+                'lost_frames': 0,
+                'position_history': track.position_history.copy()
+            }
+            track.state = TrackState.Lost
+        else:
+            track.mark_removed()  # Eliminar tracks que no han sido observados lo suficiente
+
+    def get_dists_with_position_history(self, position_history, new_bbox):
+        """
+        Calcula la distancia Euclidiana entre la última posición en el historial de un track perdido y una nueva detección.
+        """
+        if len(position_history) < 1:
+            return float('inf')  # No hay suficiente historial para comparar
+
+        # Calcular la distancia de la última posición en el historial con la nueva posición
+        last_position = position_history[-1][:2]  # Última posición conocida (x, y)
+        new_position = new_bbox[:2]  # Nueva posición detectada (x, y)
+        distance = np.linalg.norm(np.array(last_position) - np.array(new_position))  # Distancia Euclidiana
+
+        return distance
+    
+    def calculate_reid_score(self, lost_bbox, new_bbox):
+        """
+        Calcula el puntaje de reidentificación usando la diferencia de tamaño y distancia.
+        """
+        size_lost = lost_bbox[2] * lost_bbox[3]  # Área del track perdido
+        size_new = new_bbox[2] * new_bbox[3]  # Área de la nueva detección
+        size_ratio = min(size_lost, size_new) / max(size_lost, size_new)
+
+        return size_ratio
+
+    def reidentify_track(self, new_track):
+        """
+        Intenta reidentificar un track perdido usando el historial de posiciones y tamaño.
+        """
+        new_bbox = new_track.tlwh
+        best_reid_id = None
+        min_distance = float('inf')
+
+        for lost_id, lost_data in self.lost_tracks.items():
+            lost_bbox = lost_data['bbox']
+            position_history = lost_data['position_history']
+
+            # Calcular la distancia con la última posición en el historial
+            distance = self.get_dists_with_position_history(position_history, new_bbox)
+            size_score = self.calculate_reid_score(lost_bbox, new_bbox)
+
+            # Verificar si cumplen las condiciones de reidentificación
+            if distance <= DISTANCE_TOLERANCE and size_score >= (1 - SIZE_TOLERANCE) and lost_data['lost_frames'] <= self.max_time_lost:
+                if distance < min_distance or best_reid_id is None:
+                    min_distance = distance
+                    best_reid_id = lost_id
+
+        return best_reid_id
     @staticmethod
     def reset_id():
         """Resets the ID counter for STrack instances to ensure unique track IDs across tracking sessions."""

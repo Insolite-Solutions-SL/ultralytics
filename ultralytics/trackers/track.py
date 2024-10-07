@@ -39,7 +39,7 @@ def on_predict_start(predictor: object, persist: bool = False) -> None:
 
     # Retrieve the frame rate from the YAML configuration; use default value of 30 if not defined.    frame_rate = getattr(cfg, 'frame_rate', 30)
     frame_rate = getattr(cfg, 'frame_rate', 30)
-    
+
     if cfg.tracker_type not in {"bytetrack", "botsort"}:
         raise AssertionError(f"Only 'bytetrack' and 'botsort' are supported for now, but got '{cfg.tracker_type}'")
 
