@@ -361,7 +361,7 @@ class BYTETracker:
             if track.state == TrackState.Tracked:
                 track.update(det, self.frame_id)
                 activated_stracks.append(track)
-            else:
+            elif self.frame_id - track.frame_id >= MIN_OBSERVED_FRAMES:  # Asegurar un mínimo de frames en `Lost`
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
         # Step 3: Second association, with low score detection boxes association the untrack to the low score detections
@@ -376,7 +376,7 @@ class BYTETracker:
             if track.state == TrackState.Tracked:
                 track.update(det, self.frame_id)
                 activated_stracks.append(track)
-            else:
+            elif self.get_dists_with_position_history(track.position_history, det.tlwh) <= DISTANCE_TOLERANCE:
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
 
@@ -401,13 +401,14 @@ class BYTETracker:
                 lost_track_candidates = [t for t in self.lost_stracks if t.track_id == reid_id]
                 if len(lost_track_candidates) > 0:
                     lost_track = lost_track_candidates[0]
-                else:
-                    LOGGER.warning(f"Track {reid_id} encontrado en `self.lost_tracks` pero no en `self.lost_stracks`.")
-                    continue  # Saltar este reidentificación si no está sincronizado
 
-                # Reactivar el track perdido con la nueva detección
-                lost_track.re_activate(det, self.frame_id, new_id=False)
-                activated_stracks.append(lost_track)
+                    # Reactivar el track perdido con la nueva detección
+                    if lost_track not in activated_stracks:  # Evitar reactivación duplicada
+                        lost_track.re_activate(det, self.frame_id, new_id=False)
+                        activated_stracks.append(lost_track)
+                else:
+                    LOGGER.info(f"Track {reid_id} encontrado en `self.lost_tracks` pero no en `self.lost_stracks`.")
+                    continue  # Saltar este reidentificación si no está sincronizado
 
                 # Eliminar el track del diccionario de tracks perdidos
                 if reid_id in self.lost_tracks:
@@ -535,6 +536,7 @@ class BYTETracker:
                     best_reid_id = lost_id
 
         return best_reid_id
+    
     @staticmethod
     def reset_id():
         """Resets the ID counter for STrack instances to ensure unique track IDs across tracking sessions."""
