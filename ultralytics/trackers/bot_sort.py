@@ -9,6 +9,7 @@ from .byte_tracker import BYTETracker, STrack
 from .utils import matching
 from .utils.gmc import GMC
 from .utils.kalman_filter import KalmanFilterXYWH
+from ..utils import LOGGER
 
 
 class BOTrack(STrack):
@@ -75,7 +76,15 @@ class BOTrack(STrack):
         self.features = deque([], maxlen=feat_history)
         self.alpha = 0.9
 
-    def update_features(self, feat):
+
+    def update(self, new_track, frame_id):
+        """Actualiza la instancia de BOTrack con nueva información de track y el frame actual."""
+        if self.is_track_unstable(frames_threshold=10, size_variation_threshold=0.3):
+            LOGGER.info(f"Track {self.track_id} no se actualizará en frame {frame_id} debido a inestabilidad detectada.")
+            return  # No actualizar si el track es inestable
+        if new_track.curr_feat is not None:
+            self.update_features(new_track.curr_feat)
+        super().update(new_track, frame_id)
         """Update the feature vector and apply exponential moving average smoothing."""
         feat /= np.linalg.norm(feat)
         self.curr_feat = feat
@@ -95,7 +104,15 @@ class BOTrack(STrack):
 
         self.mean, self.covariance = self.kalman_filter.predict(mean_state, self.covariance)
 
+
     def re_activate(self, new_track, frame_id, new_id=False):
+        """Reactivates a track with updated features and optionally assigns a new ID."""
+        if self.is_track_unstable(frames_threshold=10, size_variation_threshold=0.3):
+            LOGGER.info(f"Track {self.track_id} no se reactivará en frame {frame_id} debido a inestabilidad detectada.")
+            return  # No reactivar si el track es inestable
+        if new_track.curr_feat is not None:
+            self.update_features(new_track.curr_feat)
+        super().re_activate(new_track, frame_id, new_id)
         """Reactivates a track with updated features and optionally assigns a new ID."""
         if new_track.curr_feat is not None:
             self.update_features(new_track.curr_feat)

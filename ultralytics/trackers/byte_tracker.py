@@ -11,7 +11,7 @@ from .utils.kalman_filter import KalmanFilterXYAH
 
 # Parámetros de coincidencia y reidentificación
 DISTANCE_TOLERANCE = 100.0  # Máxima distancia permitida para considerar que es el mismo track (en píxeles)
-SIZE_TOLERANCE = 0.4       # Tolerancia máxima de diferencia de tamaño (40%)
+SIZE_TOLERANCE = 0.4   # Tolerancia máxima de diferencia de tamaño (40%)
 MIN_OBSERVED_FRAMES = 5     # Número mínimo de frames observados antes de marcar un track como perdido
 
 # Diccionario para almacenar los tracks que se pierden temporalmente
@@ -89,6 +89,8 @@ class STrack(BaseTrack):
         # Nuevo: Añadir un historial de posiciones para cada track
         self.position_history = []  # Almacena las posiciones previas del track para evaluación
         self.position_history.append(self._tlwh.copy())  # Inicializar con la posición actual
+        self.stationary_count = 0  # Contador para frames estacionarios
+        self.low_confidence_count = 0  # Contador para frames con baja confianza
 
     def predict(self):
         """Predicts the next state (mean and covariance) of the object using the Kalman filter."""
@@ -142,6 +144,7 @@ class STrack(BaseTrack):
         if frame_id == 1:
             self.is_activated = True
         self.frame_id = frame_id
+        LOGGER.info(f"[INIT] Track {self.track_id} activado en el frame {frame_id} con bounding box {self.tlwh}.")
         self.start_frame = frame_id
 
     def re_activate(self, new_track, frame_id, new_id=False):
@@ -153,6 +156,7 @@ class STrack(BaseTrack):
         self.state = TrackState.Tracked
         self.is_activated = True
         self.frame_id = frame_id
+        LOGGER.info(f"[REID] Track {self.track_id} reactivado en el frame {frame_id}. Bounding box: {self.tlwh}.")
         if new_id:
             self.track_id = self.next_id()
         self.score = new_track.score
@@ -191,10 +195,73 @@ class STrack(BaseTrack):
 
         # Nuevo: Añadir la nueva posición al historial
         self.position_history.append(self.tlwh.copy())
+        LOGGER.info(
+            f"[UPDATE] Frame {frame_id} | Track {self.track_id} actualizado: Posición={self.tlwh}, "
+            f"Tamaño (w, h) = ({self.tlwh[2]}, {self.tlwh[3]}) | Área={self.tlwh[2] * self.tlwh[3]:.2f}"
+        )
 
     def convert_coords(self, tlwh):
         """Convert a bounding box's top-left-width-height format to its x-y-aspect-height equivalent."""
         return self.tlwh_to_xyah(tlwh)
+    
+
+    def is_stationary(self, frames_threshold=20, size_variation_threshold=0.1, detect_false_positive=True):
+        """
+        Detecta si un track es estacionario y tiene variaciones controladas en tamaño y posición en su historial.
+        
+        Args:
+            frames_threshold (int): Número de frames consecutivos para evaluar la estacionariedad.
+            size_variation_threshold (float): Umbral de variación de tamaño para considerar el track como estacionario.
+            detect_false_positive (bool): Evalúa si el track estacionario tiene variabilidad anormal.
+
+        Returns:
+            str: "false_positive" si es un falso positivo, "legitimate" si es estacionario legítimo, o False.
+        """
+        if len(self.position_history) < frames_threshold:
+            return False
+
+        # Extraer las posiciones y calcular el desplazamiento promedio del centro
+        centers = np.array([entry[:2] for entry in self.position_history[-frames_threshold:]])
+        areas = np.array([entry[2] * entry[3] for entry in self.position_history[-frames_threshold:]])
+        center_movements = np.linalg.norm(np.diff(centers, axis=0), axis=1)
+        avg_movement = np.mean(center_movements)
+
+        # Calcular variación de tamaño
+        size_variations = np.abs(np.diff(areas) / areas[:-1])
+        avg_size_variation = np.mean(size_variations)
+
+        if avg_movement < 5.0 and avg_size_variation < size_variation_threshold:
+            self.stationary_count += 1
+            if detect_false_positive and avg_size_variation > size_variation_threshold:
+                return "false_positive"
+
+            return "legitimate" if self.stationary_count >= frames_threshold else False
+        else:
+            self.stationary_count = 0
+        return False
+
+
+    def is_track_unstable(self, frames_threshold=10, size_variation_threshold=0.3):
+        """
+        Detecta si un track muestra variaciones continuas e inestables en su tamaño.
+
+        Args:
+            frames_threshold (int): Número de frames consecutivos para evaluar la inestabilidad.
+            size_variation_threshold (float): Umbral de variación para considerar el track como inestable.
+
+        Returns:
+            bool: True si es inestable, False de lo contrario.
+        """
+        if len(self.position_history) < frames_threshold:
+            return False
+
+        # Calcular variaciones en el área del bounding box
+        areas = np.array([entry[2] * entry[3] for entry in self.position_history[-frames_threshold:]])
+        size_variations = np.abs(np.diff(areas) / areas[:-1])
+        avg_size_variation = np.mean(size_variations)
+
+        # Detectar inestabilidad por variación constante
+        return avg_size_variation > size_variation_threshold
 
     @property
     def tlwh(self):
@@ -307,10 +374,13 @@ class BYTETracker:
 
         # Nuevo: Diccionario para manejar los tracks perdidos localmente en BYTETracker
         self.lost_tracks = {}
+        # Diccionario para almacenar la información de tracks estacionarios
+        self.stationary_tracks_info = {}
 
     def update(self, results, img=None):
         """Updates the tracker with new detections and returns the current list of tracked objects."""
         self.frame_id += 1
+        max_low_confidence_frames = 10  # Umbral para eliminar tracks de baja confianza
         activated_stracks = []
         refind_stracks = []
         lost_stracks = []
@@ -389,6 +459,12 @@ class BYTETracker:
                 # Incrementar el contador de frames perdidos si ya estaba marcado como perdido
                 self.lost_tracks[track.track_id]['lost_frames'] += 1
 
+        # Insertar la lógica de limpieza aquí:
+        for track_id, track_data in list(self.lost_tracks.items()):
+            if track_data['lost_frames'] > self.max_time_lost:
+                LOGGER.info(f"[LOST TRACK REMOVED] Eliminando track {track_id} por exceder el tiempo perdido permitido ({self.max_time_lost} frames).")
+                del self.lost_tracks[track_id]
+
         # Intentar reidentificar tracks perdidos usando el historial de posiciones y tamaño
         for idet in u_detection:
             det = detections[idet]
@@ -438,12 +514,56 @@ class BYTETracker:
                 track.mark_removed()
                 removed_stracks.append(track)
 
-        # Eliminar los tracks eliminados del diccionario `lost_tracks`
+
+        # Registrar cambios de estado de tracks
+        for track in lost_stracks:
+            LOGGER.info(f"[LOST] Track {track.track_id} marcado como perdido en el frame {self.frame_id}.")
+
         for track in removed_stracks:
-            if track.track_id in self.lost_tracks:
-                del self.lost_tracks[track.track_id]        
+            LOGGER.info(f"[REMOVED] Track {track.track_id} eliminado en el frame {self.frame_id}.")
+
+        for track in activated_stracks:
+            LOGGER.info(f"[ACTIVATED] Track {track.track_id} activado en el frame {self.frame_id}.")             
 
         self.tracked_stracks = [t for t in self.tracked_stracks if t.state == TrackState.Tracked]
+        # Registrar información detallada sobre las posiciones y tamaños de los tracks en cada frame
+        for track in self.tracked_stracks:
+            # Extraer la posición y el tamaño del bounding box
+            x, y, w, h = track.tlwh
+            area = w * h
+
+            # Guardar un log con la información actual del track
+            LOGGER.info(
+                f"Frame {self.frame_id} | Track {track.track_id} | "
+                f"Position (x={x:.2f}, y={y:.2f}) | Size (w={w:.2f}, h={h:.2f}) | Area: {area:.2f}"
+            )
+
+                
+        # Paso 3: Detección de falsos positivos basados en patrones inestables y estacionariedad sospechosa
+        removed_stracks = []
+        for track in self.tracked_stracks:
+            # Detectar si es un track inestable
+            if track.is_track_unstable():
+                LOGGER.info(f"Track {track.track_id} marcado como inestable y eliminado en frame {self.frame_id}.")
+                removed_stracks.append(track)
+            else:
+                # Detectar si es estacionario o un falso positivo
+                stationary_result = track.is_stationary()
+                if stationary_result == "false_positive":
+                    LOGGER.info(f"Track {track.track_id} marcado como estacionario falso positivo y eliminado.")
+                    removed_stracks.append(track)
+                elif stationary_result:
+                    LOGGER.info(f"Track {track.track_id} es estacionario legítimo y permanece en seguimiento.")
+
+
+        # Actualizar el estado de los tracks con los filtrados
+        self.tracked_stracks = [t for t in self.tracked_stracks if t not in removed_stracks]
+
+        # Eliminar solo tracks con un flag de error o sin actividad reciente
+        for track in removed_stracks:
+            if track.track_id in self.lost_tracks:
+                del self.lost_tracks[track.track_id]
+
         self.tracked_stracks = self.joint_stracks(self.tracked_stracks, activated_stracks)
         self.tracked_stracks = self.joint_stracks(self.tracked_stracks, refind_stracks)
         self.lost_stracks = self.sub_stracks(self.lost_stracks, self.tracked_stracks)
@@ -453,6 +573,20 @@ class BYTETracker:
         self.removed_stracks.extend(removed_stracks)
         if len(self.removed_stracks) > 1000:
             self.removed_stracks = self.removed_stracks[-999:]  # clip remove stracks to 1000 maximum
+        
+        LOGGER.info(f"[SUMMARY] Frame {self.frame_id} | Activos: {len(self.tracked_stracks)} | "
+            f"Perdidos: {len(self.lost_stracks)} | Removidos: {len(self.removed_stracks)}")
+
+
+        # Mostrar un resumen de los tracks estacionarios detectados
+        if len(self.stationary_tracks_info) > 0:
+            LOGGER.info(f"Resumen de tracks estacionarios detectados hasta el frame {self.frame_id}:")
+            for track_id, info in self.stationary_tracks_info.items():
+                LOGGER.info(
+                    f"Track {track_id} | Detectado en frame {info['frame_detected']} | "
+                    f"Posiciones: {[pos[:2] for pos in info['position_history']]} | "
+                    f"Historial de tamaño: {info['size_history']}"
+                )
 
         return np.asarray([x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
 
@@ -480,14 +614,26 @@ class BYTETracker:
         Marca un track como perdido y lo almacena en el diccionario `lost_tracks` de BYTETracker.
         """
         if track.tracklet_len >= MIN_OBSERVED_FRAMES:
+            # Revisar el estado del track: estacionario legítimo, falso positivo, o no estacionario.
+            stationary_status = track.is_stationary(frames_threshold=20, size_variation_threshold=0.15)
+
+            if stationary_status == "false_positive":
+                LOGGER.info(f"[FALSE POSITIVE] Track {track.track_id} detectado como falso positivo y eliminado.")
+                track.mark_removed()
+                return  # No marcar como `Lost`, ya que es un falso positivo
+
+            # Si es estacionario legítimo, guardarlo con el flag adecuado
             self.lost_tracks[track.track_id] = {
                 'bbox': track.tlwh.copy(),
                 'lost_frames': 0,
-                'position_history': track.position_history.copy()
+                'position_history': track.position_history.copy(),
+                'stationary': stationary_status == True  # True solo si es estacionario legítimo
             }
             track.state = TrackState.Lost
+            LOGGER.info(f"[LOST] Track {track.track_id} ha sido marcado como perdido en el frame {self.frame_id}.")
         else:
             track.mark_removed()  # Eliminar tracks que no han sido observados lo suficiente
+
 
     def get_dists_with_position_history(self, position_history, new_bbox):
         """
@@ -522,12 +668,22 @@ class BYTETracker:
         min_distance = float('inf')
 
         for lost_id, lost_data in self.lost_tracks.items():
+            if lost_data.get('stationary', False):
+                continue
+
+            if lost_data['lost_frames'] > self.max_time_lost // 2:  # Umbral ajustable para limitar los intentos de REID
+                LOGGER.info(f"[REID SKIPPED] Track {lost_id} excedió el límite de intentos de reidentificación y será omitido.")
+                continue
             lost_bbox = lost_data['bbox']
             position_history = lost_data['position_history']
 
             # Calcular la distancia con la última posición en el historial
             distance = self.get_dists_with_position_history(position_history, new_bbox)
             size_score = self.calculate_reid_score(lost_bbox, new_bbox)
+
+            # Agregar logs para cada paso de la evaluación
+            LOGGER.info(f"[REID] Intentando reidentificar track perdido con ID {lost_id}. Distancia: {distance:.2f}, "
+                     f"Size score: {size_score:.2f}, Frame actual: {self.frame_id}.")
 
             # Verificar si cumplen las condiciones de reidentificación
             if distance <= DISTANCE_TOLERANCE and size_score >= (1 - SIZE_TOLERANCE) and lost_data['lost_frames'] <= self.max_time_lost:
